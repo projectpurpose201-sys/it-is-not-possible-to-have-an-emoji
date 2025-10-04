@@ -23,6 +23,7 @@ import { useSession } from "../../contexts/AuthContext";
 import { theme } from "../../utils/theme";
 import { supabase } from "../../utils/supabaseClient";
 import { StatusBar as RNStatusBar } from "react-native";
+
 const SCREEN_WIDTH = Dimensions.get("window").width;
 
 const VAN_REGION = {
@@ -53,6 +54,16 @@ const [drop, setDrop] = useState<{ latitude: number; longitude: number; address?
   const [searchQuery, setSearchQuery] = useState("");
   const [dropAddress, setDropAddress] = useState<string>("");
   const LOCATIONIQ_KEY = "pk.6528e5690b2a09e0c624889317ee6965";
+  // Ride booking state
+const [rideId, setRideId] = useState<string | null>(null);
+const [ride, setRide] = useState<any>(null);
+const [countdown, setCountdown] = useState<number>(0);
+const timerRef = useRef<NodeJS.Timeout | null>(null);
+useEffect(() => {
+  if (countdown <= 0 && rideId && ride?.status === "pending") {
+    autoCancelIfNoDriver();
+  }
+}, [countdown, rideId, ride]);
 
   // --- Get current location ---
   useEffect(() => {
@@ -195,6 +206,129 @@ const handleConfirmDrop = async () => {
     setFare(null);
     setDropAddress("");
   };
+const handleBookRide = async () => {
+  if (!pickup || !drop || !fare) {
+    Alert.alert("Error", "Pickup, drop, or fare missing!");
+    return;
+  }
+
+    if (!user) {
+    Alert.alert("Login Required", "You need to be logged in to book a ride.");
+    return;
+  }
+
+
+  const { data, error } = await supabase
+    .from("rides")
+    .insert([{
+      passenger_id: user.id,
+      pickup_lat: pickup.latitude,
+      pickup_lng: pickup.longitude,
+      pickup_address: pickup.address,
+      drop_lat: drop.latitude,
+      drop_lng: drop.longitude,
+      drop_address: drop.address,
+      fare_estimate: fare,
+      status: "pending",
+    }])
+    .select()
+    .single();
+
+  if (error) {
+    console.error("Booking failed:", error);
+    Alert.alert("Error", "Failed to book ride.");
+    return;
+  }
+
+  setRideId(data.id);
+  setRide(data);
+  setConfirmed(true);
+
+  // start 2 min countdown
+  setCountdown(120);
+  if (timerRef.current) clearInterval(timerRef.current);
+
+  timerRef.current = setInterval(() => {
+    setCountdown((prev) => {
+      if (prev <= 1) {
+        clearInterval(timerRef.current!);
+        autoCancelIfNoDriver(); // auto cancel
+        return 0;
+      }
+      return prev - 1;
+    });
+  }, 1000);
+};
+const autoCancelIfNoDriver = async () => {
+  if (!rideId || !ride) return;
+
+  if (ride.status === "pending") {
+    console.log("⏳ Auto cancelling ride:", rideId);
+
+    const { error } = await supabase
+      .from("rides")
+      .update({ status: "expired" })
+      .eq("id", rideId);
+
+    if (error) {
+      console.error("Auto cancel failed:", error);
+      return;
+    }
+
+    if (timerRef.current) clearInterval(timerRef.current);
+
+    resetRideState(); // clear ride state in UI
+    Alert.alert(
+      "No Driver Found",
+      "Sorry, no drivers accepted your ride in time 😔. Please try again!"
+    );
+  }
+};
+
+
+
+const handleCancelRide = async () => {
+  if (!rideId) return;
+
+  console.log("Cancelling ride:", rideId);
+
+  const { error } = await supabase
+    .from("rides")
+    .update({ status: "cancelled_by_passenger" })
+    .eq("id", rideId);
+
+  if (error) {
+    console.error("Cancel failed:", error);
+    Alert.alert("Error", "Could not cancel ride.");
+    return;
+  }
+
+  if (timerRef.current) clearInterval(timerRef.current);
+
+  resetRideState(); // <-- clear UI + state
+  Alert.alert("Ride Cancelled", "You cancelled the ride.");
+};
+
+
+const resetRideState = () => {
+  setRideId(null);
+  setRide(null);
+  setConfirmed(false);
+  setDrop(null);
+  setRouteCoords([]);
+  setDistance(null);
+  setFare(null);
+  setCountdown(0);
+};
+
+
+
+
+useEffect(() => {
+  return () => {
+    if (timerRef.current) clearInterval(timerRef.current);
+  };
+}, []);
 
   const handleLogout = async () => {
     try {
@@ -222,6 +356,47 @@ const handleConfirmDrop = async () => {
       return () => subscription.remove();
     }, [drawerOpen])
   );
+useEffect(() => {
+  if (!rideId) return;
+
+  const channel = supabase.channel("ride_" + rideId)
+    .on(
+      "postgres_changes",
+      { event: "UPDATE", schema: "public", table: "rides", filter: `id=eq.${rideId}` },
+      (payload) => {
+        const newRide = payload.new;
+        console.log("Ride updated:", newRide);
+        setRide(newRide);
+
+        if (newRide.status === "accepted") {
+          Alert.alert("Driver found!", "Your driver has accepted the ride.");
+        }
+        if (newRide.status === "arrived") {
+          Alert.alert("Driver arrived!", "Please meet your driver.");
+        }
+        if (newRide.status === "in_progress") {
+          Alert.alert("Ride Started", "Enjoy your trip.");
+        }
+        if (newRide.status === "completed") {
+          Alert.alert("Ride Completed", "Thanks for riding!");
+          setRideId(null);
+        }
+        if (newRide.status === "cancelled_by_driver" || newRide.status === "cancelled_by_passenger") {
+          Alert.alert("Ride Cancelled", "Your ride was cancelled.");
+          setRideId(null);
+        }
+      }
+    )
+    .subscribe();
+
+  return () => {
+    supabase.removeChannel(channel);
+  };
+}, [rideId]);
+const fullName =
+  (user && "user_metadata" in user ? (user as any).user_metadata.full_name : null) ||
+  user?.email ||
+  "Guest";
 
   return (
     <SafeAreaView style={styles.container}>
@@ -248,7 +423,9 @@ const handleConfirmDrop = async () => {
           <View style={styles.profilePlaceholder}>
             <Ionicons name="person-circle-outline" size={60} color="#ccc" />
           </View>
-          <Text style={styles.drawerName}>{user?.name}</Text>
+          <Text style={styles.drawerName}>{fullName}</Text>
+
+
         </View>
         <TouchableOpacity style={styles.drawerItem} onPress={() => router.push("/passenger/profile")}>
           <Text>Profile</Text>
@@ -321,28 +498,44 @@ const handleConfirmDrop = async () => {
 
       {/* Booking Card */}
       <View style={styles.bookingCard}>
-        {!confirmed ? (
-          <TouchableOpacity style={[styles.mainButton, { backgroundColor: theme.colors.primary }]} onPress={handleConfirmDrop}>
-            <Text style={styles.mainButtonText}>Confirm Drop</Text>
-          </TouchableOpacity>
-        ) : (
-          <>
-            <Text style={styles.info}>Distance: {distance?.toFixed(2)} km</Text>
-            <Text style={styles.info}>Estimated Fare: ₹{fare}</Text>
+  {!confirmed ? (
+    <TouchableOpacity
+      style={[styles.mainButton, { backgroundColor: theme.colors.primary }]}
+      onPress={handleConfirmDrop}
+    >
+      <Text style={styles.mainButtonText}>Confirm Drop</Text>
+    </TouchableOpacity>
+  ) : rideId && ride?.status === "pending" ? (
+    <>
+      <Text style={styles.info}>Searching for a driver...</Text>
+      <Text style={styles.info}>Time left: {countdown}s</Text>
 
-            <TouchableOpacity
-              style={[styles.mainButton, { backgroundColor: theme.colors.primary }]}
-              onPress={() => Alert.alert("Ride booked instantly!")}
-            >
-              <Text style={styles.mainButtonText}>Instant Book</Text>
-            </TouchableOpacity>
+      <TouchableOpacity
+        style={[styles.mainButton, { backgroundColor: "red" }]}
+        onPress={handleCancelRide}
+      >
+        <Text style={styles.mainButtonText}>Cancel Ride</Text>
+      </TouchableOpacity>
+    </>
+  ) : (
+    <>
+      <Text style={styles.info}>Distance: {distance?.toFixed(2)} km</Text>
+      <Text style={styles.info}>Estimated Fare: ₹{fare}</Text>
 
-            <TouchableOpacity style={styles.changeButton} onPress={handleChangeDrop}>
-              <Text style={styles.changeButtonText}>Change Drop</Text>
-            </TouchableOpacity>
-          </>
-        )}
-      </View>
+      <TouchableOpacity
+        style={[styles.mainButton, { backgroundColor: theme.colors.primary }]}
+        onPress={handleBookRide}
+      >
+        <Text style={styles.mainButtonText}>Instant Book</Text>
+      </TouchableOpacity>
+
+      <TouchableOpacity style={styles.changeButton} onPress={handleChangeDrop}>
+        <Text style={styles.changeButtonText}>Change Drop</Text>
+      </TouchableOpacity>
+    </>
+  )}
+</View>
+
 
       {/* Footer / Bottom Tabs */}
       <View style={styles.footer}>
